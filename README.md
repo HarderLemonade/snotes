@@ -74,6 +74,44 @@ Basic controls:
 
 ---
 
+## Installation
+
+snotes is a single Python script. No build system, no pip, no packaging.
+
+Download it, make it executable, and place it in your `$PATH`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/HarderLemonade/snotes/main/snotes -o snotes
+chmod +x snotes
+sudo install snotes /usr/local/bin/snotes
+```
+
+Or install it locally without root:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/HarderLemonade/snotes/main/snotes -o snotes
+chmod +x snotes
+mkdir -p ~/.local/bin
+mv snotes ~/.local/bin/
+```
+
+(make sure `~/.local/bin` is in your `$PATH`)
+
+---
+
+## Requirements
+
+- Python 3.10+
+- OpenSSL (`openssl` available in PATH)
+
+---
+
+## Run
+
+```bash
+snotes
+```
+
 ## Philosophy
 
 snotes is designed to be:
