@@ -76,7 +76,7 @@ Basic controls:
 
 ## Installation
 
-snotes is a single Python script. No build system, no pip, no packaging.
+snotes is a single Python script.
 
 Download it, make it executable, and place it in your `$PATH`:
 
