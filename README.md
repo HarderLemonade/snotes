@@ -1,5 +1,6 @@
 # snotes
 
+![snotes screenshot](https://raw.githubusercontent.com/HarderLemonade/snotes/main/snotes.png)
 snotes is a small encrypted terminal notes app written in Python.
 
 It is built for people who want private, local notes without a GUI, cloud account, or unnecessary complexity. Everything lives in a single encrypted file, and you interact with it through a fast terminal interface.
