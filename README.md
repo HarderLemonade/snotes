@@ -126,6 +126,12 @@ No sync, no accounts, no hidden services. Just your notes, encrypted, in one fil
 
 ---
 
+## AI Disclosure
+
+Portions of this project were developed with assistance from AI tools.
+
+AI was used for tasks such as code refinement, debugging, and documentation. All code and design decisions were reviewed and validated by the author.
+
 ## License
 
 This project is licensed under the **GNU General Public License v2.0 (GPL-2.0)**.
