@@ -1,0 +1,1009 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import base64
+import curses
+import datetime as dt
+import getpass
+import hashlib
+import hmac
+import json
+import os
+import secrets
+import shlex
+import subprocess
+import sys
+import tempfile
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+
+__author__ = "Ben@LostGeek.NET"
+__version__ = "0.1.1"
+
+FORMAT_VERSION = 2
+DEFAULT_STORE = Path.home() / ".local" / "share" / "snotes" / ".snotesdb"
+SCRYPT_N = 2**14
+SCRYPT_R = 8
+SCRYPT_P = 1
+KEY_LEN = 64
+AES_KEY_LEN = 32
+MAC_KEY_LEN = 32
+FILE_MAGIC = "SNOTES2"
+TITLE_COLOR_KEYS = ["default", "yellow", "cyan", "green", "magenta", "blue", "red"]
+TITLE_COLOR_CURSES = {
+    "yellow": curses.COLOR_YELLOW,
+    "cyan": curses.COLOR_CYAN,
+    "green": curses.COLOR_GREEN,
+    "magenta": curses.COLOR_MAGENTA,
+    "blue": curses.COLOR_BLUE,
+    "red": curses.COLOR_RED,
+}
+
+
+class VaultError(Exception):
+    pass
+
+
+@dataclass
+class VaultKeys:
+    encryption_key: bytes
+    mac_key: bytes
+
+
+@dataclass
+class SearchQuery:
+    include: list[str]
+    exclude: list[str]
+
+
+@dataclass
+class MatchLine:
+    text: str
+    highlights: list[tuple[int, int]]
+
+
+def b64e(value: bytes) -> str:
+    return base64.b64encode(value).decode("ascii")
+
+
+def b64d(value: str) -> bytes:
+    return base64.b64decode(value.encode("ascii"))
+
+
+def derive_keys(password: str, salt: bytes) -> VaultKeys:
+    stretched = hashlib.scrypt(
+        password.encode("utf-8"),
+        salt=salt,
+        n=SCRYPT_N,
+        r=SCRYPT_R,
+        p=SCRYPT_P,
+        dklen=KEY_LEN,
+        maxmem=0,
+    )
+    return VaultKeys(
+        encryption_key=stretched[:AES_KEY_LEN],
+        mac_key=stretched[AES_KEY_LEN:AES_KEY_LEN + MAC_KEY_LEN],
+    )
+
+
+def run_openssl(args: list[str], data: bytes) -> bytes:
+    proc = subprocess.run(
+        ["openssl", "enc", *args],
+        input=data,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if proc.returncode != 0:
+        message = proc.stderr.decode("utf-8", errors="replace").strip()
+        raise VaultError(f"OpenSSL failed: {message or 'unknown error'}")
+    return proc.stdout
+
+
+def encrypt_blob(plaintext: bytes, keys: VaultKeys) -> tuple[bytes, bytes, bytes]:
+    iv = secrets.token_bytes(16)
+    ciphertext = run_openssl(
+        [
+            "-aes-256-ctr",
+            "-e",
+            "-nosalt",
+            "-nopad",
+            "-K",
+            keys.encryption_key.hex(),
+            "-iv",
+            iv.hex(),
+        ],
+        plaintext,
+    )
+    mac = hmac.new(keys.mac_key, iv + ciphertext, hashlib.sha256).digest()
+    return iv, ciphertext, mac
+
+
+def decrypt_blob(iv: bytes, ciphertext: bytes, mac: bytes, keys: VaultKeys) -> bytes:
+    expected_mac = hmac.new(keys.mac_key, iv + ciphertext, hashlib.sha256).digest()
+    if not hmac.compare_digest(mac, expected_mac):
+        raise VaultError("Authentication failed. Wrong password or vault data was modified.")
+    return run_openssl(
+        [
+            "-aes-256-ctr",
+            "-d",
+            "-nosalt",
+            "-nopad",
+            "-K",
+            keys.encryption_key.hex(),
+            "-iv",
+            iv.hex(),
+        ],
+        ciphertext,
+    )
+
+
+def ensure_private_file(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        path.touch(mode=0o600)
+    os.chmod(path, 0o600)
+
+
+def atomic_write(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as handle:
+        tmp_path = Path(handle.name)
+        os.chmod(tmp_path, 0o600)
+        handle.write(content)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+    os.replace(tmp_path, path)
+
+    try:
+        dir_fd = os.open(path.parent, os.O_DIRECTORY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
+
+
+def empty_vault() -> dict:
+    return {"notes": []}
+
+
+def now_ts() -> int:
+    return int(time.time())
+
+
+def normalize_vault_data(data: dict) -> dict:
+    if "notes" not in data or not isinstance(data["notes"], list):
+        raise VaultError("Vault contents are invalid.")
+    for note in data["notes"]:
+        if not isinstance(note, dict):
+            raise VaultError("Vault contents are invalid.")
+        color = note.get("title_color", "default")
+        if color not in TITLE_COLOR_KEYS:
+            color = "default"
+        note["title_color"] = color
+    return data
+
+
+def next_title_color(current: str | None) -> str:
+    key = current if current in TITLE_COLOR_KEYS else "default"
+    index = TITLE_COLOR_KEYS.index(key)
+    return TITLE_COLOR_KEYS[(index + 1) % len(TITLE_COLOR_KEYS)]
+
+
+def make_snapshot(data: dict, password: str) -> str:
+    salt = secrets.token_bytes(16)
+    keys = derive_keys(password, salt)
+    plaintext = json.dumps(data, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    iv, ciphertext, mac = encrypt_blob(plaintext, keys)
+    snapshot = {
+        "version": FORMAT_VERSION,
+        "saved_at": now_ts(),
+        "kdf": {
+            "name": "scrypt",
+            "salt": b64e(salt),
+            "n": SCRYPT_N,
+            "r": SCRYPT_R,
+            "p": SCRYPT_P,
+            "dklen": KEY_LEN,
+        },
+        "cipher": {
+            "name": "aes-256-ctr+hmac-sha256",
+            "iv": b64e(iv),
+            "mac": b64e(mac),
+            "data": b64e(ciphertext),
+        },
+    }
+    encoded = json.dumps(snapshot, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return b64e(encoded)
+
+
+def decode_snapshot(encoded: str, password: str) -> dict:
+    try:
+        snapshot = json.loads(b64d(encoded).decode("utf-8"))
+        salt = b64d(snapshot["kdf"]["salt"])
+        keys = derive_keys(password, salt)
+        plaintext = decrypt_blob(
+            b64d(snapshot["cipher"]["iv"]),
+            b64d(snapshot["cipher"]["data"]),
+            b64d(snapshot["cipher"]["mac"]),
+            keys,
+        )
+        return normalize_vault_data(json.loads(plaintext.decode("utf-8")))
+    except (KeyError, ValueError, json.JSONDecodeError, TypeError) as exc:
+        raise VaultError("Snapshot is invalid or corrupted.") from exc
+
+
+def parse_search_query(raw: str) -> SearchQuery:
+    include: list[str] = []
+    exclude: list[str] = []
+    for token in shlex.split(raw):
+        lowered = token.lower()
+        if lowered.startswith("-") and len(lowered) > 1:
+            exclude.append(lowered[1:])
+        elif lowered:
+            include.append(lowered)
+    return SearchQuery(include=include, exclude=exclude)
+
+
+def highlighted_ranges(text: str, terms: list[str]) -> list[tuple[int, int]]:
+    lowered = text.lower()
+    ranges: list[tuple[int, int]] = []
+    for term in terms:
+        start = 0
+        while term:
+            idx = lowered.find(term, start)
+            if idx == -1:
+                break
+            ranges.append((idx, idx + len(term)))
+            start = idx + len(term)
+    if not ranges:
+        return []
+    ranges.sort()
+    merged = [ranges[0]]
+    for start, end in ranges[1:]:
+        prev_start, prev_end = merged[-1]
+        if start <= prev_end:
+            merged[-1] = (prev_start, max(prev_end, end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def wrap_highlighted_line(text: str, ranges: list[tuple[int, int]], width: int) -> list[MatchLine]:
+    if width <= 0:
+        return []
+    if not text:
+        return [MatchLine("", [])]
+    chunks: list[MatchLine] = []
+    start = 0
+    while start < len(text):
+        end = min(len(text), start + width)
+        segment = text[start:end]
+        segment_ranges: list[tuple[int, int]] = []
+        for left, right in ranges:
+            if right <= start or left >= end:
+                continue
+            segment_ranges.append((max(0, left - start), min(len(segment), right - start)))
+        chunks.append(MatchLine(segment, segment_ranges))
+        start = end
+    return chunks
+
+
+def build_preview_lines(note: dict | None, raw_query: str, width: int, limit: int) -> list[MatchLine]:
+    if width <= 0 or limit <= 0:
+        return []
+    if not note:
+        return [MatchLine("No note selected.", [])]
+
+    query = parse_search_query(raw_query)
+    include_terms = query.include
+    lines = [f"Title: {note['title']}", "", *note["body"].splitlines()]
+    if not include_terms:
+        preview: list[MatchLine] = []
+        for line in lines:
+            preview.extend(wrap_highlighted_line(line, [], width))
+            if len(preview) >= limit:
+                return preview[:limit]
+        return preview[:limit] or [MatchLine("", [])]
+
+    matched: list[MatchLine] = []
+    for line in lines:
+        ranges = highlighted_ranges(line, include_terms)
+        if not ranges:
+            continue
+        matched.extend(wrap_highlighted_line(line, ranges, width))
+        if len(matched) >= limit:
+            return matched[:limit]
+    if matched:
+        return matched[:limit]
+    return [MatchLine("No matching lines in selected note.", [])]
+
+
+class VaultStore:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    def exists(self) -> bool:
+        return self.path.exists() and self.path.stat().st_size > 0
+
+    def create(self, password: str) -> None:
+        if self.exists():
+            raise VaultError(f"Vault already exists at {self.path}")
+        self.save(empty_vault(), password)
+
+    def load(self, password: str) -> dict:
+        if not self.exists():
+            raise VaultError(f"No vault found at {self.path}")
+        raw = self.path.read_text(encoding="utf-8")
+        if raw.lstrip().startswith("{"):
+            return self._load_legacy_json(raw, password)
+
+        snapshots = self._read_snapshot_lines(raw)
+        errors: list[str] = []
+        for label in ("CURRENT", "PREVIOUS"):
+            encoded = snapshots.get(label)
+            if not encoded:
+                continue
+            try:
+                return decode_snapshot(encoded, password)
+            except VaultError as exc:
+                errors.append(f"{label.lower()}: {exc}")
+        detail = "; ".join(errors) if errors else "no readable snapshots found"
+        raise VaultError(f"Unable to unlock vault: {detail}.")
+
+    def save(self, data: dict, password: str) -> None:
+        normalize_vault_data(data)
+        previous_snapshot = self._existing_current_snapshot()
+        current_snapshot = make_snapshot(data, password)
+        lines = [FILE_MAGIC, f"CURRENT {current_snapshot}"]
+        if previous_snapshot:
+            lines.append(f"PREVIOUS {previous_snapshot}")
+        ensure_private_file(self.path)
+        atomic_write(self.path, ("\n".join(lines) + "\n").encode("utf-8"))
+
+    def _existing_current_snapshot(self) -> str | None:
+        if not self.exists():
+            return None
+        raw = self.path.read_text(encoding="utf-8")
+        if raw.lstrip().startswith("{"):
+            payload = json.loads(raw)
+            return b64e(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+        return self._read_snapshot_lines(raw).get("CURRENT")
+
+    def _load_legacy_json(self, raw: str, password: str) -> dict:
+        try:
+            payload = json.loads(raw)
+            if payload.get("version") != 1:
+                raise VaultError("Unsupported vault version.")
+            salt = b64d(payload["kdf"]["salt"])
+            keys = derive_keys(password, salt)
+            plaintext = decrypt_blob(
+                b64d(payload["cipher"]["iv"]),
+                b64d(payload["cipher"]["data"]),
+                b64d(payload["cipher"]["mac"]),
+                keys,
+            )
+            return normalize_vault_data(json.loads(plaintext.decode("utf-8")))
+        except (KeyError, ValueError, json.JSONDecodeError, TypeError) as exc:
+            raise VaultError("Legacy vault is invalid or corrupted.") from exc
+
+    def _read_snapshot_lines(self, raw: str) -> dict[str, str]:
+        lines = raw.splitlines()
+        if not lines or lines[0].strip() != FILE_MAGIC:
+            raise VaultError("Vault header is invalid or corrupted.")
+        snapshots: dict[str, str] = {}
+        for line in lines[1:]:
+            if not line.strip():
+                continue
+            try:
+                label, encoded = line.split(" ", 1)
+            except ValueError:
+                continue
+            if label in {"CURRENT", "PREVIOUS"} and encoded:
+                snapshots[label] = encoded.strip()
+        return snapshots
+
+
+class Session:
+    def __init__(self, store: VaultStore, password: str, data: dict) -> None:
+        self.store = store
+        self.password = password
+        self.data = data
+
+    def save(self) -> None:
+        self.store.save(self.data, self.password)
+
+    def list_notes(self) -> list[dict]:
+        return sorted(
+            self.data["notes"],
+            key=lambda item: (item.get("updated_at", 0), item["title"].lower()),
+            reverse=True,
+        )
+
+    def add_note(self, title: str, body: str, title_color: str = "default") -> None:
+        note_id = secrets.token_hex(8)
+        ts = now_ts()
+        self.data["notes"].append(
+            {
+                "id": note_id,
+                "title": title,
+                "body": body,
+                "title_color": title_color if title_color in TITLE_COLOR_KEYS else "default",
+                "created_at": ts,
+                "updated_at": ts,
+            }
+        )
+        self.save()
+
+    def update_note(self, note_id: str, title: str, body: str) -> None:
+        for note in self.data["notes"]:
+            if note["id"] != note_id:
+                continue
+            note["title"] = title
+            note["body"] = body
+            note["updated_at"] = now_ts()
+            self.save()
+            return
+        raise VaultError("Note not found.")
+
+    def cycle_note_title_color(self, note_id: str) -> str:
+        for note in self.data["notes"]:
+            if note["id"] != note_id:
+                continue
+            note["title_color"] = next_title_color(note.get("title_color"))
+            note["updated_at"] = now_ts()
+            self.save()
+            return note["title_color"]
+        raise VaultError("Note not found.")
+
+    def find_note(self, query: str) -> dict | None:
+        query_lower = query.lower()
+        for note in self.list_notes():
+            if note["id"] == query:
+                return note
+            if note["title"].lower() == query_lower:
+                return note
+        return None
+
+    def delete_note(self, query: str) -> bool:
+        note = self.find_note(query)
+        if not note:
+            return False
+        self.data["notes"] = [item for item in self.data["notes"] if item["id"] != note["id"]]
+        self.save()
+        return True
+
+    def search(self, term: str) -> list[dict]:
+        query = parse_search_query(term)
+        if not query.include and not query.exclude:
+            return []
+        results: list[dict] = []
+        for note in self.list_notes():
+            haystack = f"{note['title']}\n{note['body']}".lower()
+            if any(token not in haystack for token in query.include):
+                continue
+            if any(token in haystack for token in query.exclude):
+                continue
+            results.append(note)
+        return results
+
+
+def format_note_timestamp(ts: int) -> str:
+    return dt.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+
+
+def editor_command() -> list[str]:
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
+    return shlex.split(editor)
+
+
+def editor_command_for_path(
+    path: Path,
+    note: dict | None = None,
+    place_cursor_after_title: bool = False,
+) -> list[str]:
+    command = editor_command()
+    if not command:
+        return ["vi", str(path)]
+
+    editor_name = Path(command[0]).name.lower()
+    is_new_note = note is None or place_cursor_after_title
+    if is_new_note:
+        title_column = len("Title: ") + 1
+        if editor_name in {"vi", "vim", "nvim", "view", "vim.basic", "vim.tiny"}:
+            return [*command, f"+call cursor(1,{title_column})", str(path)]
+        if editor_name == "nano":
+            return [*command, f"+1,{title_column}", str(path)]
+        if editor_name in {"hx", "helix"}:
+            return [*command, f"+:1:{title_column}", str(path)]
+    return [*command, str(path)]
+
+
+def serialize_note_for_editor(note: dict | None = None) -> str:
+    title = ""
+    body = ""
+    if note:
+        title = note["title"]
+        body = note["body"]
+    return f"Title: {title}\n\n{body}"
+
+
+def parse_note_from_editor(content: str, fallback_title: str = "") -> tuple[str, str]:
+    lines = content.splitlines()
+    if lines and lines[0].startswith("Title:"):
+        title = lines[0][len("Title:"):].strip()
+        body_lines = lines[1:]
+        if body_lines and body_lines[0] == "":
+            body_lines = body_lines[1:]
+        body = "\n".join(body_lines).strip()
+        return title or fallback_title, body
+    stripped = content.strip()
+    return fallback_title, stripped
+
+
+def edit_note_in_editor(
+    note: dict | None = None,
+    place_cursor_after_title: bool = False,
+) -> tuple[str, str] | None:
+    initial = serialize_note_for_editor(note)
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        prefix="snotes-",
+        suffix=".txt",
+        delete=False,
+    ) as handle:
+        temp_path = Path(handle.name)
+        os.chmod(temp_path, 0o600)
+        handle.write(initial)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+    before = temp_path.read_text(encoding="utf-8")
+    try:
+        proc = subprocess.run(
+            editor_command_for_path(temp_path, note, place_cursor_after_title=place_cursor_after_title),
+            check=False,
+        )
+        if proc.returncode != 0:
+            raise VaultError(f"Editor exited with status {proc.returncode}.")
+        after = temp_path.read_text(encoding="utf-8")
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+    if after == before:
+        return None
+
+    title, body = parse_note_from_editor(after, fallback_title=note["title"] if note else "")
+    if not title.strip():
+        raise VaultError("Title cannot be empty.")
+    return title.strip(), body
+
+
+class TuiApp:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+        self.query = ""
+        self.status = "Arrows move, Enter edits, a adds, D duplicates, d deletes, C color-cycles, / live filter, q quits."
+        self.selected = 0
+        self.scroll = 0
+        self.search_mode = False
+        self.colors_enabled = False
+        self.title_color_pairs: dict[str, int] = {}
+        self.pending_delete_note_id: str | None = None
+
+    def filtered_notes(self) -> list[dict]:
+        if not self.query.strip():
+            return self.session.list_notes()
+        return self.session.search(self.query)
+
+    def move_selection(self, delta: int) -> None:
+        notes = self.filtered_notes()
+        if not notes:
+            self.selected = 0
+            self.scroll = 0
+            return
+        self.selected = max(0, min(self.selected + delta, len(notes) - 1))
+
+    def ensure_visible(self, height: int, count: int) -> None:
+        if count <= 0:
+            self.selected = 0
+            self.scroll = 0
+            return
+        self.selected = max(0, min(self.selected, count - 1))
+        if self.selected < self.scroll:
+            self.scroll = self.selected
+        if self.selected >= self.scroll + height:
+            self.scroll = self.selected - height + 1
+        self.scroll = max(0, self.scroll)
+
+    def launch_editor(
+        self,
+        note: dict | None,
+        place_cursor_after_title: bool = False,
+    ) -> tuple[str, str] | None:
+        curses.def_prog_mode()
+        curses.endwin()
+        try:
+            return edit_note_in_editor(note, place_cursor_after_title=place_cursor_after_title)
+        finally:
+            curses.reset_prog_mode()
+            try:
+                curses.curs_set(0)
+            except curses.error:
+                pass
+
+    def delete_selected(self, note: dict) -> None:
+        if self.session.delete_note(note["id"]):
+            self.status = f"Deleted '{note['title']}'."
+        else:
+            self.status = "Note not found."
+
+    def request_delete_selected(self, note: dict) -> None:
+        self.pending_delete_note_id = note["id"]
+        self.status = f"Delete '{note['title']}'? Press y to confirm, any other key to cancel."
+
+    def clear_pending_delete(self) -> None:
+        self.pending_delete_note_id = None
+
+    def open_selected(self, note: dict | None) -> None:
+        try:
+            result = self.launch_editor(note)
+            if result is None:
+                self.status = "No changes saved."
+                return
+            title, body = result
+            if note is None:
+                self.session.add_note(title, body)
+                self.status = f"Created '{title}'."
+            else:
+                self.session.update_note(note["id"], title, body)
+                self.status = f"Saved '{title}'."
+        except VaultError as exc:
+            self.status = f"Error: {exc}"
+
+    def duplicate_selected(self, note: dict) -> None:
+        draft = {
+            "title": f"{note['title']} (2)",
+            "body": note["body"],
+            "title_color": note.get("title_color", "default"),
+        }
+        try:
+            result = self.launch_editor(draft, place_cursor_after_title=True)
+            if result is None:
+                self.status = "Duplicate cancelled."
+                return
+            title, body = result
+            self.session.add_note(title, body, title_color=draft["title_color"])
+            self.status = f"Duplicated '{note['title']}' as '{title}'."
+            self.selected = 0
+        except VaultError as exc:
+            self.status = f"Error: {exc}"
+
+    def cycle_selected_title_color(self, note: dict) -> None:
+        try:
+            color = self.session.cycle_note_title_color(note["id"])
+            self.status = f"Title color for '{note['title']}' set to {color}."
+        except VaultError as exc:
+            self.status = f"Error: {exc}"
+
+    def selected_note(self) -> dict | None:
+        notes = self.filtered_notes()
+        if not notes:
+            return None
+        self.selected = max(0, min(self.selected, len(notes) - 1))
+        return notes[self.selected]
+
+    def update_query(self, value: str) -> None:
+        self.query = value
+        self.selected = 0
+        self.scroll = 0
+        self.status = f"{len(self.filtered_notes())} notes matched."
+
+    def init_colors(self) -> None:
+        self.colors_enabled = False
+        self.title_color_pairs = {}
+        if not curses.has_colors():
+            return
+        try:
+            curses.start_color()
+            curses.use_default_colors()
+            for index, color_name in enumerate(TITLE_COLOR_KEYS[1:], start=1):
+                curses.init_pair(index, TITLE_COLOR_CURSES[color_name], -1)
+                self.title_color_pairs[color_name] = curses.color_pair(index)
+            self.colors_enabled = True
+        except curses.error:
+            self.colors_enabled = False
+            self.title_color_pairs = {}
+
+    def note_title_attr(self, note: dict | None) -> int:
+        if not note or not self.colors_enabled:
+            return curses.A_NORMAL
+        return self.title_color_pairs.get(note.get("title_color", "default"), curses.A_NORMAL)
+
+    def draw_match_line(
+        self,
+        stdscr: curses.window,
+        row: int,
+        col: int,
+        width: int,
+        match_line: MatchLine,
+    ) -> None:
+        try:
+            stdscr.addnstr(row, col, match_line.text, width)
+            for start, end in match_line.highlights:
+                if start >= width:
+                    continue
+                segment = match_line.text[start:min(end, width)]
+                stdscr.addnstr(row, col + start, segment, max(0, width - start), curses.A_BOLD)
+        except curses.error:
+            pass
+
+    def draw(self, stdscr: curses.window) -> None:
+        stdscr.erase()
+        height, width = stdscr.getmaxyx()
+
+        if height < 4 or width < 20:
+            try:
+                stdscr.addnstr(0, 0, "Window too small.", max(1, width - 1), curses.A_BOLD)
+                stdscr.refresh()
+            except curses.error:
+                pass
+            return
+
+        header = "snotes"
+        try:
+            stdscr.addnstr(0, 0, header, max(1, width - 1), curses.A_BOLD)
+            mode = "SEARCH" if self.search_mode else "BROWSE"
+            filter_text = self.query if self.query else "<none>"
+            stdscr.addnstr(1, 0, f"{mode}  Filter: {filter_text}", max(1, width - 1))
+            stdscr.hline(2, 0, "-", max(1, width - 1))
+        except curses.error:
+            return
+
+        notes = self.filtered_notes()
+        list_top = 3
+        list_height = max(1, height - 5)
+        self.ensure_visible(list_height, len(notes))
+
+        divider_x = max(24, width // 2)
+        if divider_x >= width - 1:
+            divider_x = max(10, width // 2)
+
+        left_width = max(10, divider_x - 1)
+        right_col = min(width - 1, divider_x + 1)
+        right_width = max(1, width - right_col)
+
+        try:
+            stdscr.addnstr(2, 0, "Notes", left_width, curses.A_BOLD)
+            if right_width > 1:
+                stdscr.addnstr(2, right_col, "Matches", right_width, curses.A_BOLD)
+            if divider_x < width:
+                for row in range(3, height - 2):
+                    stdscr.addch(row, divider_x, ord("|"))
+        except curses.error:
+            pass
+
+        if not notes:
+            try:
+                stdscr.addnstr(list_top, 0, "No matching notes.", left_width)
+            except curses.error:
+                pass
+        else:
+            visible = notes[self.scroll:self.scroll + list_height]
+            date_width = 16
+            title_width = max(8, left_width - date_width - 3)
+            for idx, note in enumerate(visible, start=self.scroll):
+                row = list_top + idx - self.scroll
+                marker = ">" if idx == self.selected else " "
+                title = note["title"][:title_width]
+                updated = format_note_timestamp(note.get("updated_at", note.get("created_at", 0)))
+                line = f"{marker} {title:<{title_width}} {updated}"
+                attr = self.note_title_attr(note)
+                if idx == self.selected:
+                    attr |= curses.A_REVERSE
+                try:
+                    stdscr.addnstr(row, 0, line, left_width, attr)
+                except curses.error:
+                    pass
+
+        selected_note = self.selected_note()
+        preview_lines = build_preview_lines(selected_note, self.query, max(1, right_width), list_height)
+        for index, match_line in enumerate(preview_lines[:list_height]):
+            row = list_top + index
+            if right_col < width:
+                try:
+                    if index == 0 and selected_note and match_line.text.startswith("Title: "):
+                        stdscr.addnstr(row, right_col, match_line.text, right_width, self.note_title_attr(selected_note))
+                    else:
+                        self.draw_match_line(stdscr, row, right_col, right_width, match_line)
+                except curses.error:
+                    pass
+
+        try:
+            stdscr.hline(height - 2, 0, "-", max(1, width - 1))
+            stdscr.addnstr(height - 1, 0, self.status, max(1, width - 1))
+            if self.search_mode:
+                cursor_x = min(width - 1, len(f"{mode}  Filter: {self.query}"))
+                stdscr.move(1, cursor_x)
+            stdscr.refresh()
+        except curses.error:
+            pass
+
+    def run(self, stdscr: curses.window) -> int:
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        stdscr.keypad(True)
+        self.init_colors()
+
+        while True:
+            notes = self.filtered_notes()
+            self.draw(stdscr)
+            key = stdscr.getch()
+
+            if self.pending_delete_note_id is not None:
+                note = self.session.find_note(self.pending_delete_note_id)
+                if key in (ord("y"), ord("Y")):
+                    if note is None:
+                        self.status = "Note not found."
+                    else:
+                        self.delete_selected(note)
+                else:
+                    self.status = "Delete cancelled."
+                self.clear_pending_delete()
+                continue
+
+            if self.search_mode:
+                if key == 27:
+                    self.search_mode = False
+                    self.status = "Search mode closed."
+                    try:
+                        curses.curs_set(0)
+                    except curses.error:
+                        pass
+                    continue
+                if key in (curses.KEY_BACKSPACE, 127, 8):
+                    if self.query:
+                        self.update_query(self.query[:-1])
+                    continue
+                if key in (10, 13, curses.KEY_ENTER):
+                    self.search_mode = False
+                    self.status = f"{len(notes)} notes matched."
+                    try:
+                        curses.curs_set(0)
+                    except curses.error:
+                        pass
+                    continue
+                if 32 <= key <= 126:
+                    self.update_query(self.query + chr(key))
+                    continue
+                if key in (curses.KEY_UP, ord("k")):
+                    self.move_selection(-1)
+                    continue
+                if key in (curses.KEY_DOWN, ord("j")):
+                    self.move_selection(1)
+                    continue
+                continue
+
+            if key in (ord("q"), 27):
+                return 0
+            if key in (curses.KEY_UP, ord("k")):
+                self.move_selection(-1)
+                continue
+            if key in (curses.KEY_DOWN, ord("j")):
+                self.move_selection(1)
+                continue
+            if key == curses.KEY_NPAGE:
+                self.move_selection(10)
+                continue
+            if key == curses.KEY_PPAGE:
+                self.move_selection(-10)
+                continue
+            if key == ord("g"):
+                self.selected = 0
+                continue
+            if key == ord("G"):
+                self.selected = max(0, len(notes) - 1)
+                continue
+            if key in (10, 13, curses.KEY_ENTER):
+                if notes:
+                    self.open_selected(notes[self.selected])
+                else:
+                    self.status = "No note selected."
+                continue
+            if key == ord("a"):
+                self.open_selected(None)
+                self.selected = 0
+                continue
+            if key == ord("d"):
+                if notes:
+                    self.request_delete_selected(notes[self.selected])
+                else:
+                    self.status = "No note selected."
+                continue
+            if key == ord("D"):
+                if notes:
+                    self.duplicate_selected(notes[self.selected])
+                else:
+                    self.status = "No note selected."
+                continue
+            if key == ord("C"):
+                if notes:
+                    self.cycle_selected_title_color(notes[self.selected])
+                else:
+                    self.status = "No note selected."
+                continue
+            if key == ord("/"):
+                self.search_mode = True
+                self.status = "Live search mode. Type to filter, Enter keeps, Esc exits."
+                try:
+                    curses.curs_set(1)
+                except curses.error:
+                    pass
+                continue
+            if key == ord("c"):
+                self.update_query("")
+                self.status = "Filter cleared."
+                continue
+
+
+def run_tui(session: Session) -> int:
+    try:
+        return curses.wrapper(TuiApp(session).run)
+    except KeyboardInterrupt:
+        return 0
+
+
+def unlock_or_init(store: VaultStore) -> Session:
+    if store.exists():
+        password = getpass.getpass("Vault password: ")
+        data = store.load(password)
+        return Session(store, password, data)
+
+    print(f"No vault found at {store.path}")
+    password = getpass.getpass("Create new vault password: ")
+    confirm = getpass.getpass("Confirm password: ")
+    if not password:
+        raise VaultError("Password cannot be empty.")
+    if password != confirm:
+        raise VaultError("Passwords did not match.")
+    store.create(password)
+    data = store.load(password)
+    return Session(store, password, data)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Encrypted terminal notes with a single unlock per session."
+    )
+    parser.add_argument(
+        "--vault",
+        type=Path,
+        default=DEFAULT_STORE,
+        help=f"Vault path (default: {DEFAULT_STORE})",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    store = VaultStore(args.vault)
+    try:
+        session = unlock_or_init(store)
+        return run_tui(session)
+    except VaultError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
